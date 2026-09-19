@@ -1,0 +1,5 @@
+flask>=3.0
+pyTelegramBotAPI>=4.14
+beautifulsoup4>=4.12
+requests>=2.31
+python-dotenv>=1.0
