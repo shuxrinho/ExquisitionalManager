@@ -43,6 +43,9 @@ app = Flask(__name__)
 
 _update_lock = threading.Lock()
 
+# chat_ids currently waiting to send a word submission after /add_words
+_pending_submissions = set()
+
 
 # --------------------------------------------------------------------------
 # database helpers
@@ -240,6 +243,7 @@ def send_welcome(message):
               "• /lists — index of all word lists, oldest first\n"
               "• a list number — all words from that list\n"
               "• /words — how many words are in the database\n"
+              "• /add_words — submit a word or word list for the admin to review\n"
               "• /update — rebuild the database from the channel (admin only)\n"
               "• /version — diagnostic info (admin only, useful after deploying)")
 
@@ -356,6 +360,55 @@ def force_update(message):
     # the whole scrape inline. Doing the work in a thread lets this handler
     # (and the webhook route) return immediately.
     threading.Thread(target=run, daemon=True).start()
+
+
+@bot.message_handler(commands=["add_words"])
+def add_words_prompt(message):
+    _pending_submissions.add(message.chat.id)
+    bot.reply_to(message,
+                 "Send me the word(s) and definition(s) you'd like to add, "
+                 "all in one message. Type /cancel to stop.")
+
+
+@bot.message_handler(commands=["cancel"],
+                     func=lambda m: m.chat.id in _pending_submissions)
+def cancel_submission(message):
+    _pending_submissions.discard(message.chat.id)
+    bot.reply_to(message, "Cancelled — nothing was submitted.")
+
+
+@bot.message_handler(func=lambda m: m.chat.id in _pending_submissions,
+                     content_types=["text"])
+def receive_submission(message):
+    _pending_submissions.discard(message.chat.id)
+    user = message.from_user
+    who = f"@{user.username}" if user.username else (user.first_name or "someone")
+    forward_text = (
+        f"📥 <b>New word submission</b>\n"
+        f"From: {esc(who)} (id <code>{user.id}</code>)\n\n"
+        f"{esc(message.text)}"
+    )
+    sent_to_admin = False
+    if ADMIN_ID:
+        try:
+            send_html(ADMIN_ID, forward_text)
+            sent_to_admin = True
+        except Exception:
+            traceback.print_exc()
+    if sent_to_admin:
+        bot.reply_to(message, "✅ Your words have been submitted. Thank you!")
+    else:
+        bot.reply_to(message,
+                     "⚠️ I couldn't reach the admin right now, so this wasn't "
+                     "delivered. Please try again later.")
+
+
+@bot.message_handler(func=lambda m: m.chat.id in _pending_submissions,
+                     content_types=["photo", "document", "audio", "video",
+                                    "voice", "sticker", "animation"])
+def receive_submission_wrong_type(message):
+    bot.reply_to(message,
+                 "Please send the word(s) as text (or /cancel to stop).")
 
 
 @bot.message_handler(func=lambda m: m.text and m.text.strip().isdigit(),
