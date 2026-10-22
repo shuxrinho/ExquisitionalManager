@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 
+import requests as http_requests
 import telebot
 from dotenv import load_dotenv
 from flask import Flask, abort, request
@@ -45,6 +46,67 @@ _update_lock = threading.Lock()
 
 # chat_ids currently waiting to send a word submission after /add_words
 _pending_submissions = set()
+
+# Temporary cache: word -> formatted definition text fetched from the API.
+# Entries are added when a user looks up an unknown word and the API returns
+# a result, and consumed (or expire naturally) when the inline button is pressed.
+_api_definitions = {}
+
+
+def fetch_dictionary_api(word):
+    """Fetch a definition from the Free Dictionary API.
+
+    Returns a tuple (plain_summary, html_text) on success, or (None, None)
+    if the word isn't found or the request fails.  *plain_summary* is a
+    short single-line description suitable for an admin message;
+    *html_text* is richer HTML for the user.
+    """
+    try:
+        resp = http_requests.get(
+            f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}",
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None, None
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return None, None
+
+        entry = data[0]
+        word_display = entry.get("word", word)
+        phonetic = entry.get("phonetic", "")
+
+        html_parts = []
+        plain_parts = []
+
+        for meaning in entry.get("meanings", []):
+            pos = meaning.get("partOfSpeech", "")
+            for defn in meaning.get("definitions", [])[:2]:
+                definition = defn.get("definition", "")
+                example = defn.get("example", "")
+                # HTML version
+                line = f"\u2022 <i>({esc(pos)})</i> {esc(definition)}"
+                if example:
+                    line += f'\n  <i>Example: \u201c{esc(example)}\u201d</i>'
+                html_parts.append(line)
+                # Plain version (for admin message)
+                pline = f"({pos}) {definition}"
+                if example:
+                    pline += f' \u2014 e.g. "{example}"'
+                plain_parts.append(pline)
+
+        if not html_parts:
+            return None, None
+
+        header = f"<b>{esc(word_display)}</b>"
+        if phonetic:
+            header += f"  {esc(phonetic)}"
+        html_text = header + "\n\n" + "\n".join(html_parts)
+        plain_summary = "; ".join(plain_parts)
+        return plain_summary, html_text
+    except Exception:
+        traceback.print_exc()
+        return None, None
 
 
 # --------------------------------------------------------------------------
@@ -140,13 +202,13 @@ def render_definition(row, list_row, via=None, via_rel=None):
         labels = {"alias": "an alternative form", "family": "a family word",
                   "syn": "a synonym", "phrase": "a phrase"}
         label = labels.get(via_rel, "a related word")
-        out.append(f"<i>(you typed {label}: “{esc(via)}”)</i>")
+        out.append(f"<i>(you typed {label}: \u201c{esc(via)}\u201d)</i>")
     out.append("")
     out.append(esc(row["definition"]))
     if list_row:
         d = fmt_date(list_row["date"])
         head = f"{d} {list_row['title']}" if d else list_row["title"]
-        out.append(f"\n📚 List {list_row['ord']}. {esc(head)}")
+        out.append(f"\n\U0001f4da List {list_row['ord']}. {esc(head)}")
     return "\n".join(out)
 
 
@@ -173,7 +235,7 @@ def lists_keyboard(total, current):
         return None
     buttons = [
         telebot.types.InlineKeyboardButton(
-            f"·{i}·" if i == current else str(i), callback_data=f"lpage:{i}")
+            f"\u00b7{i}\u00b7" if i == current else str(i), callback_data=f"lpage:{i}")
         for i in range(1, pages + 1)
     ]
     rows = [buttons[i:i + 8] for i in range(0, len(buttons), 8)]
@@ -239,13 +301,13 @@ def get_list_row(conn, ord_):
 def send_welcome(message):
     send_html(message.chat.id,
               "Hi! Send me any word and I'll look it up.\n\n"
-              "• a word — its definition (family words like <i>evasive</i> work too)\n"
-              "• /lists — index of all word lists, oldest first\n"
-              "• a list number — all words from that list\n"
-              "• /words — how many words are in the database\n"
-              "• /add_words — submit a word or word list for the admin to review\n"
-              "• /update — rebuild the database from the channel (admin only)\n"
-              "• /version — diagnostic info (admin only, useful after deploying)")
+              "\u2022 a word \u2014 its definition (family words like <i>evasive</i> work too)\n"
+              "\u2022 /lists \u2014 index of all word lists, oldest first\n"
+              "\u2022 a list number \u2014 all words from that list\n"
+              "\u2022 /words \u2014 how many words are in the database\n"
+              "\u2022 /add_words \u2014 submit a word or word list for the admin to review\n"
+              "\u2022 /update \u2014 rebuild the database from the channel (admin only)\n"
+              "\u2022 /version \u2014 diagnostic info (admin only, useful after deploying)")
 
 
 @bot.message_handler(commands=["version"])
@@ -282,7 +344,7 @@ def total_words(message):
         n_uniq = conn.execute("SELECT COUNT(DISTINCT word) FROM words").fetchone()[0]
         n_lists = conn.execute("SELECT COUNT(*) FROM lists").fetchone()[0]
         upd = conn.execute("SELECT v FROM meta WHERE k='updated_at'").fetchone()
-    text = (f"📊 {n_words} entries ({n_uniq} unique words) in {n_lists} lists.")
+    text = (f"\U0001f4ca {n_words} entries ({n_uniq} unique words) in {n_lists} lists.")
     if upd:
         text += f"\nLast update: {upd[0]}"
     bot.reply_to(message, text)
@@ -320,6 +382,55 @@ def lists_page(call):
         pass          # "message is not modified" when the same page is tapped twice
 
 
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("suggest:"))
+def suggest_to_admin(call):
+    """Handle the 'Send to admin for review' inline button.
+
+    Forwards the word and its cached API definition to the admin.
+    """
+    cache_key = call.data[len("suggest:"):]
+    plain_def = _api_definitions.pop(cache_key, None)
+
+    user = call.from_user
+    who = f"@{user.username}" if user.username else (user.first_name or "someone")
+
+    if plain_def:
+        forward_text = (
+            f"\U0001f4e5 <b>Word suggestion (from online dictionary)</b>\n"
+            f"From: {esc(who)} (id <code>{user.id}</code>)\n\n"
+            f"<b>{esc(cache_key)}</b>\n"
+            f"{esc(plain_def)}"
+        )
+    else:
+        # Definition was already consumed or expired; send just the word
+        forward_text = (
+            f"\U0001f4e5 <b>Word suggestion</b>\n"
+            f"From: {esc(who)} (id <code>{user.id}</code>)\n\n"
+            f"<b>{esc(cache_key)}</b>\n"
+            f"(definition was not cached \u2014 look it up manually)"
+        )
+
+    sent_to_admin = False
+    if ADMIN_ID:
+        try:
+            send_html(ADMIN_ID, forward_text)
+            sent_to_admin = True
+        except Exception:
+            traceback.print_exc()
+
+    if sent_to_admin:
+        bot.answer_callback_query(call.id, "\u2705 Sent to admin! Thank you.")
+        # Remove the inline button so it can't be pressed again
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+    else:
+        bot.answer_callback_query(
+            call.id, "\u26a0\ufe0f Couldn't reach the admin. Try again later.", show_alert=True)
+
+
 @bot.message_handler(commands=["update"])
 def force_update(message):
     if message.from_user.id != ADMIN_ID:
@@ -331,22 +442,22 @@ def force_update(message):
 
     chat_id = message.chat.id
     try:
-        status = bot.reply_to(message, "Updating database, please wait…")
+        status = bot.reply_to(message, "Updating database, please wait\u2026")
         status_id = status.message_id
     except Exception:
         # The original message may already be gone (e.g. Telegram retried an
         # old webhook delivery). Fall back to a plain message in the chat.
-        status = bot.send_message(chat_id, "Updating database, please wait…")
+        status = bot.send_message(chat_id, "Updating database, please wait\u2026")
         status_id = status.message_id
 
     def run():
         with _update_lock:
             try:
                 n_lists, n_words = update_database(log=lambda *a: None)
-                text = f"✅ Database updated: {n_lists} lists, {n_words} words."
+                text = f"\u2705 Database updated: {n_lists} lists, {n_words} words."
             except Exception as exc:                                    # noqa: BLE001
                 traceback.print_exc()
-                text = (f"❌ Update failed: {type(exc).__name__}: {exc}\n\n"
+                text = (f"\u274c Update failed: {type(exc).__name__}: {exc}\n\n"
                         "The previous database is untouched.")
         try:
             bot.edit_message_text(text, chat_id, status_id)
@@ -374,7 +485,7 @@ def add_words_prompt(message):
                      func=lambda m: m.chat.id in _pending_submissions)
 def cancel_submission(message):
     _pending_submissions.discard(message.chat.id)
-    bot.reply_to(message, "Cancelled — nothing was submitted.")
+    bot.reply_to(message, "Cancelled \u2014 nothing was submitted.")
 
 
 @bot.message_handler(func=lambda m: m.chat.id in _pending_submissions,
@@ -384,7 +495,7 @@ def receive_submission(message):
     user = message.from_user
     who = f"@{user.username}" if user.username else (user.first_name or "someone")
     forward_text = (
-        f"📥 <b>New word submission</b>\n"
+        f"\U0001f4e5 <b>New word submission</b>\n"
         f"From: {esc(who)} (id <code>{user.id}</code>)\n\n"
         f"{esc(message.text)}"
     )
@@ -396,10 +507,10 @@ def receive_submission(message):
         except Exception:
             traceback.print_exc()
     if sent_to_admin:
-        bot.reply_to(message, "✅ Your words have been submitted. Thank you!")
+        bot.reply_to(message, "\u2705 Your words have been submitted. Thank you!")
     else:
         bot.reply_to(message,
-                     "⚠️ I couldn't reach the admin right now, so this wasn't "
+                     "\u26a0\ufe0f I couldn't reach the admin right now, so this wasn't "
                      "delivered. Please try again later.")
 
 
@@ -432,7 +543,7 @@ def show_list(message):
     body = []
     for r in words:
         defn = esc(r["definition"]).replace("\n", " ")
-        body.append(f"{r['pos']}. <b>{esc(r['display'] or r['word'])}</b> — {defn}")
+        body.append(f"{r['pos']}. <b>{esc(r['display'] or r['word'])}</b> \u2014 {defn}")
     send_html(message.chat.id, head + "\n" + "\n\n".join(body))
 
 
@@ -450,14 +561,33 @@ def lookup(message):
         with get_conn() as conn:
             parts = [render_definition(r, get_list_row(conn, r["list_id"]), via, rel)
                      for r in rows[:3]]
-        send_html(message.chat.id, "\n\n———\n\n".join(parts))
+        send_html(message.chat.id, "\n\n\u2014\u2014\u2014\n\n".join(parts))
         return
 
     suggestions = difflib.get_close_matches(query.lower(), all_keys(), n=5, cutoff=0.75)
-    text = f"Sorry, “{esc(query)}” isn't in the database yet."
+    text = f"\u26a0\ufe0f \u201c<b>{esc(query)}</b>\u201d isn\u2019t in the database yet."
     if suggestions:
         text += "\n\nDid you mean: " + ", ".join(f"<b>{esc(s)}</b>" for s in suggestions)
-    send_html(message.chat.id, text)
+
+    # --- API fallback: try the Free Dictionary API ---
+    plain_def, html_def = fetch_dictionary_api(query)
+    markup = None
+    if html_def:
+        text += "\n\n\u2500\u2500\u2500\n"
+        text += "\n\U0001f4d6 <i>Definition from the Free Dictionary API:</i>\n\n"
+        text += html_def
+        # Cache the definition so the callback can retrieve it
+        cache_key = query.lower().strip()
+        _api_definitions[cache_key] = plain_def
+        # Inline button to send the word + definition to admin
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(
+            "\U0001f4e9 Send to admin for review",
+            callback_data=f"suggest:{cache_key[:50]}"))
+    else:
+        text += "\n\nI also couldn\u2019t find it in the online dictionary."
+
+    send_html(message.chat.id, text, reply_markup=markup)
 
 
 # --------------------------------------------------------------------------
