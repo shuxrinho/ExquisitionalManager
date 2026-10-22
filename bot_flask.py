@@ -54,7 +54,7 @@ _api_definitions = {}
 
 
 def fetch_dictionary_api(word):
-    """Fetch a definition from the Free Dictionary API.
+    """Fetch a definition from the Free Dictionary API (freedictionaryapi.com).
 
     Returns a tuple (plain_summary, html_text) on success, or (None, None)
     if the word isn't found or the request fails.  *plain_summary* is a
@@ -63,27 +63,35 @@ def fetch_dictionary_api(word):
     """
     try:
         resp = http_requests.get(
-            f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}",
+            f"https://freedictionaryapi.com/api/v1/entries/en/{word}",
             timeout=10,
         )
         if resp.status_code != 200:
             return None, None
         data = resp.json()
-        if not data or not isinstance(data, list):
+        if not data or not isinstance(data, dict):
             return None, None
 
-        entry = data[0]
-        word_display = entry.get("word", word)
-        phonetic = entry.get("phonetic", "")
+        word_display = data.get("word", word)
+        entries = data.get("entries", [])
 
         html_parts = []
         plain_parts = []
 
-        for meaning in entry.get("meanings", []):
-            pos = meaning.get("partOfSpeech", "")
-            for defn in meaning.get("definitions", [])[:2]:
-                definition = defn.get("definition", "")
-                example = defn.get("example", "")
+        for entry in entries:
+            pos = entry.get("partOfSpeech", "")
+            # Extract pronunciation text (first available)
+            pronunciations = entry.get("pronunciations", [])
+            phonetic = ""
+            if pronunciations:
+                phonetic = pronunciations[0].get("text", "")
+
+            for sense in entry.get("senses", [])[:2]:   # top 2 senses per entry
+                definition = sense.get("definition", "")
+                if not definition:
+                    continue
+                examples = sense.get("examples", [])
+                example = examples[0] if examples else ""
                 # HTML version
                 line = f"\u2022 <i>({esc(pos)})</i> {esc(definition)}"
                 if example:
@@ -99,8 +107,10 @@ def fetch_dictionary_api(word):
             return None, None
 
         header = f"<b>{esc(word_display)}</b>"
-        if phonetic:
-            header += f"  {esc(phonetic)}"
+        if entries and entries[0].get("pronunciations"):
+            p = entries[0]["pronunciations"][0].get("text", "")
+            if p:
+                header += f"  {esc(p)}"
         html_text = header + "\n\n" + "\n".join(html_parts)
         plain_summary = "; ".join(plain_parts)
         return plain_summary, html_text
